@@ -95,11 +95,22 @@ async def upload_csv(file: UploadFile = File(...)):
         raise HTTPException(400, "CSV file is empty.")
 
     detected = detect_chinese_columns(df)
+
+    # A column literally named "description" (any case) is treated as
+    # per-row context/notes for the translation agents — useful for tone
+    # and register, but not translated content itself, so it's excluded
+    # from the final output CSV.
+    context_column = next(
+        (c for c in df.columns if str(c).strip().lower() == "description"),
+        None,
+    )
+
     session_id = str(uuid.uuid4())
     sessions[session_id] = {
         "df": df,
         "detected_columns": detected,
         "filename": file.filename,
+        "context_column": context_column,
     }
 
     return {
@@ -107,6 +118,7 @@ async def upload_csv(file: UploadFile = File(...)):
         "detected_columns": detected,
         "row_count": len(df),
         "all_columns": list(df.columns),
+        "context_column": context_column,
     }
 
 
@@ -147,6 +159,7 @@ async def start_translation(req: TranslateRequest, background_tasks: BackgroundT
         session["df"].copy(),
         req.confirmed_columns,
         req.target_languages,
+        session.get("context_column"),
     )
 
     return {"job_id": job_id}
