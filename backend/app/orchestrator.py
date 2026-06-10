@@ -234,10 +234,11 @@ async def run_translation_job(
         for key in _output_keys(source_columns, target_langs):
             df[key] = ""
 
-        # Track flagged rows for /status reporting without adding a
-        # "translation_confidence" column to the downloadable CSV — the
-        # final output should only contain the original Chinese content
-        # plus the translated columns.
+        # Write translations back into df. We don't expose the raw
+        # "translation_confidence" levels in the output, but rows that came
+        # back hard-flagged or stayed at "low" confidence even after the
+        # Haiku retry are marked in a trailing "needs_review" column so a
+        # human can quickly find them.
         flagged = 0
         for idx, row_result in all_results.items():
             for key, val in row_result["translations"].items():
@@ -250,6 +251,12 @@ async def run_translation_job(
         # output — it was only a hint for the translation agents.
         if context_column and context_column in df.columns:
             df = df.drop(columns=[context_column])
+
+        # Add the review flag last so it appears as the rightmost column.
+        df["needs_review"] = ""
+        for idx, row_result in all_results.items():
+            if row_result["flagged"] or row_result["confidence"] == "low":
+                df.at[idx, "needs_review"] = "Yes"
 
         jobs[job_id].update(
             flagged=flagged,
