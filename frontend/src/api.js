@@ -37,3 +37,27 @@ export async function getStatus(jobId) {
 export function downloadUrl(jobId) {
   return `${BASE}/download/${jobId}`
 }
+
+export async function getLanguages() {
+  const res = await fetch(`${BASE}/languages`)
+  if (!res.ok) throw new Error('Failed to load supported languages')
+  return res.json()
+}
+
+export async function chatAgent({ sessionId, message, phase, targetLanguages }) {
+  const res = await fetch(`${BASE}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_id: sessionId,
+      message,
+      phase,
+      target_languages: targetLanguages || [],
+    }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Chat request failed')
+  }
+  return res.json()
+}

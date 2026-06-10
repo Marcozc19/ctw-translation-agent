@@ -108,11 +108,10 @@ async def _process_batch(
         return results
 
     # ── Stage 3: Haiku for escalated rows ─────────────────────────────────
-    esc_batch = [
-        {"id": idx, **{col: next(r["_source"].get(col, "") for r in rows if r["_idx"] == idx)}
-         for col in source_cols}
-        for idx in escalate_ids
-    ]
+    esc_batch = []
+    for idx in escalate_ids:
+        row_data = next(r for r in rows if r["_idx"] == idx)
+        esc_batch.append({"id": idx, **{col: row_data["_source"].get(col, "") for col in source_cols}})
 
     haiku_data = await translate_batch_haiku(esc_batch, source_cols, target_langs, prev_translations)
 

@@ -83,14 +83,16 @@ def detect_chinese_columns(df: pd.DataFrame) -> list[str]:
 # JSON helpers
 # ---------------------------------------------------------------------------
 
-def _parse_json(text: str) -> list | None:
+def _parse_json(text: str):
+    """Parse a JSON array or object out of an LLM response, tolerating
+    markdown code fences and surrounding commentary."""
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        m = re.search(r"\[.*\]", text, re.DOTALL)
+        m = re.search(r"[\[{].*[\]}]", text, re.DOTALL)
         if m:
             try:
                 return json.loads(m.group())
@@ -99,14 +101,20 @@ def _parse_json(text: str) -> list | None:
     return None
 
 
+# Languages the pipeline knows how to translate into. Shared with the chat
+# agent (for free-text language matching) and exposed to the frontend via
+# GET /languages so the UI doesn't need its own hardcoded copy.
+SUPPORTED_LANGUAGES = {
+    "en": "English", "es": "Spanish", "fr": "French", "de": "German",
+    "ja": "Japanese", "ko": "Korean", "pt": "Portuguese", "vi": "Vietnamese",
+    "th": "Thai", "id": "Indonesian", "ar": "Arabic", "hi": "Hindi",
+    "ru": "Russian", "it": "Italian", "nl": "Dutch", "ms": "Malay",
+    "tr": "Turkish", "pl": "Polish", "sv": "Swedish", "zh-TW": "Traditional Chinese",
+}
+
+
 def _lang_name(code: str) -> str:
-    names = {
-        "en": "English", "es": "Spanish", "fr": "French", "de": "German",
-        "ja": "Japanese", "ko": "Korean", "pt": "Portuguese", "vi": "Vietnamese",
-        "th": "Thai", "id": "Indonesian", "ar": "Arabic", "hi": "Hindi",
-        "ru": "Russian", "it": "Italian", "nl": "Dutch",
-    }
-    return names.get(code, code)
+    return SUPPORTED_LANGUAGES.get(code, code)
 
 
 def _output_keys(source_cols: list[str], target_langs: list[str]) -> list[str]:
@@ -165,14 +173,20 @@ async def back_translate_gemini(text: str, target_lang: str) -> str | None:
     """Translate `text` (in target_lang) back to Simplified Chinese."""
     prompt = (
         f"Translate the following {_lang_name(target_lang)} text back to Simplified Chinese. "
-        f"Return ONLY the Chinese translation, nothing else.\n\nText: {text}"
+        f"Return ONLY the Chinese translation — no pinyin, no alternatives, "
+        f"no explanation, no extra text of any kind.\n\nText: {text}"
     )
     try:
+        from google.genai import types
+
         client = _get_gemini()
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         response = await client.aio.models.generate_content(
             model=model_name,
             contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0)
+            ),
         )
         return response.text.strip()
     except Exception as exc:
@@ -246,3 +260,87 @@ async def translate_batch_haiku(
     except Exception as exc:
         logger.error("Haiku translation failed: %s", exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Agent 5 — Chat Concierge (Claude Haiku 4.5)
+# ---------------------------------------------------------------------------
+#
+# Front-of-house conversational agent. Replaces the old client-side regex
+# language parser: it reads the user's free-text message (which may contain
+# typos, language names in any language, abbreviations, or be totally
+# unrelated to translation) and decides whether the user is selecting target
+# languages or just chatting/asking a question.
+
+_FALLBACK_CHAT_REPLY = (
+    "Sorry, I had trouble processing that just now. Could you try rephrasing — "
+    "for example, tell me which languages you'd like (e.g. \"English and Spanish\")?"
+)
+
+
+async def chat_agent(message: str, context: dict) -> dict:
+    """
+    Returns: {"intent": "set_languages" | "chat", "languages": [...], "reply": "..."}
+
+    - intent == "set_languages": `languages` is a non-empty list of ISO codes
+      (validated against SUPPORTED_LANGUAGES) the user wants to translate to.
+    - intent == "chat": general conversation — `reply` is shown to the user
+      and no translation job is started. `languages` is always [].
+    """
+    lang_options = ", ".join(f"{code}={name}" for code, name in SUPPORTED_LANGUAGES.items())
+
+    system = (
+        "You are the CTW Translation Agent — a friendly, helpful chat assistant "
+        "embedded in a tool that translates CSV files containing Chinese text "
+        "into other languages.\n\n"
+        f"Supported target languages (ISO code = name): {lang_options}\n\n"
+        "Given the conversation context (JSON) and the user's latest message, decide:\n"
+        "1. Is the user specifying which language(s) to translate the file into? "
+        "This can be phrased many ways, in any language, with abbreviations, or "
+        "with typos/misspellings (e.g. 'Spnish' -> es, 'Janpanese' -> ja, "
+        "'日本語' or '日文' -> ja, 'castellano' -> es). If so, set "
+        "intent='set_languages' and list the matching ISO codes from the "
+        "supported list in 'languages'.\n"
+        "2. Otherwise, this is general conversation — greetings, small talk, "
+        "questions about how the tool works, what languages are supported, "
+        "the status of the file, or anything else. Set intent='chat' and "
+        "write a short, friendly, helpful reply. If the user asks something "
+        "totally unrelated to translation, you can still chat briefly, but "
+        "gently steer back to the task when relevant.\n\n"
+        "Rules:\n"
+        "- If context.phase is 'idle' (no file uploaded yet) and the user "
+        "names languages, acknowledge it conversationally but set "
+        "intent='chat' (there's nothing to translate yet) and remind them to "
+        "upload a CSV first.\n"
+        "- If context.phase is 'translating', set intent='chat' — don't start "
+        "a new job while one is running.\n"
+        "- If you genuinely cannot match any language to the supported list, "
+        "set intent='chat' and ask for clarification, listing 2-3 example "
+        "languages.\n"
+        "- Keep 'reply' concise (1-3 sentences), warm, and conversational. "
+        "It is shown directly to the user in a chat bubble.\n\n"
+        "Respond with ONLY a JSON object, no markdown, no commentary:\n"
+        '{"intent": "set_languages" | "chat", "languages": ["en", "es", ...], "reply": "..."}'
+    )
+
+    user = f"Context: {json.dumps(context)}\n\nUser message: {message}"
+
+    try:
+        resp = await _get_claude().messages.create(
+            model=os.getenv("HAIKU_MODEL", "claude-haiku-4-5-20251001"),
+            max_tokens=512,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        parsed = _parse_json(resp.content[0].text)
+        if isinstance(parsed, dict) and "reply" in parsed:
+            languages = [
+                l for l in parsed.get("languages", []) or []
+                if l in SUPPORTED_LANGUAGES
+            ]
+            intent = "set_languages" if (parsed.get("intent") == "set_languages" and languages) else "chat"
+            return {"intent": intent, "languages": languages, "reply": parsed["reply"]}
+    except Exception as exc:
+        logger.error("Chat agent failed: %s", exc)
+
+    return {"intent": "chat", "languages": [], "reply": _FALLBACK_CHAT_REPLY}

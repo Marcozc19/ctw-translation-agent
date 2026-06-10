@@ -1,53 +1,27 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import UploadZone from './components/UploadZone.jsx'
 import ChatMessage from './components/ChatMessage.jsx'
-import { uploadCSV, startTranslation, getStatus, downloadUrl } from './api.js'
+import { uploadCSV, startTranslation, getStatus, downloadUrl, getLanguages, chatAgent } from './api.js'
 
-// ── Language parsing ───────────────────────────────────────────────────────
-
-const LANG_MAP = {
-  english: 'en', en: 'en',
-  spanish: 'es', español: 'es', espanol: 'es', es: 'es',
-  french: 'fr', français: 'fr', francais: 'fr', fr: 'fr',
-  german: 'de', deutsch: 'de', de: 'de',
-  japanese: 'ja', ja: 'ja',
-  korean: 'ko', ko: 'ko',
-  portuguese: 'pt', português: 'pt', portugues: 'pt', pt: 'pt',
-  vietnamese: 'vi', vi: 'vi',
-  thai: 'th', th: 'th',
-  indonesian: 'id', id: 'id',
-  arabic: 'ar', ar: 'ar',
-  hindi: 'hi', hi: 'hi',
-  russian: 'ru', ru: 'ru',
-  italian: 'it', italiano: 'it', it: 'it',
-  dutch: 'nl', nl: 'nl',
-  malay: 'ms', ms: 'ms',
-}
-
-const LANG_NAMES = {
+// Fallback display names — overwritten by GET /languages on mount, but kept
+// so the UI still renders sensible labels if that call fails.
+const DEFAULT_LANG_NAMES = {
   en: 'English', es: 'Spanish', fr: 'French', de: 'German',
   ja: 'Japanese', ko: 'Korean', pt: 'Portuguese', vi: 'Vietnamese',
   th: 'Thai', id: 'Indonesian', ar: 'Arabic', hi: 'Hindi',
   ru: 'Russian', it: 'Italian', nl: 'Dutch', ms: 'Malay',
-}
-
-function parseLanguages(text) {
-  const words = text.toLowerCase().replace(/[,&+]/g, ' ').split(/\s+/)
-  const codes = []
-  for (const w of words) {
-    const code = LANG_MAP[w.replace(/[^a-zàáâãäåæçèéêëìíîïðñòóôõöùúûüýþÿ]/gi, '')]
-    if (code && !codes.includes(code)) codes.push(code)
-  }
-  return codes
+  tr: 'Turkish', pl: 'Polish', sv: 'Swedish', 'zh-TW': 'Traditional Chinese',
 }
 
 // ── Phase machine ──────────────────────────────────────────────────────────
-// idle → uploaded → awaiting_languages → translating → done | error
+// idle → uploaded → translating → done | error
+// (the user can also just chat at any point — language selection and
+// general conversation are both handled by the backend chat agent)
 
 const WELCOME = {
   role: 'agent',
   id: 'welcome',
-  content: 'Hello! I\'m the CTW Translation Agent. Upload a CSV file with Chinese content and I\'ll translate it to any languages you choose.',
+  content: 'Hello! I\'m the CTW Translation Agent. Upload a CSV file with Chinese content and tell me which languages to translate it into — or just ask me anything about how this works.',
 }
 
 export default function App() {
@@ -63,12 +37,18 @@ export default function App() {
   const [jobId, setJobId] = useState(null)
   const [jobStatus, setJobStatus] = useState(null)
   const [targetLangs, setTargetLangs] = useState([])
+  const [langNames, setLangNames] = useState(DEFAULT_LANG_NAMES)
 
   const bottomRef = useRef(null)
   const pollRef = useRef(null)
 
   const addMessage = useCallback((msg) => {
     setMessages((prev) => [...prev, { ...msg, id: Math.random().toString(36).slice(2) }])
+  }, [])
+
+  // Load supported languages from the backend (falls back to defaults on error)
+  useEffect(() => {
+    getLanguages().then(setLangNames).catch(() => {})
   }, [])
 
   // Auto-scroll
@@ -95,7 +75,7 @@ export default function App() {
 
           addMessage({
             role: 'agent',
-            content: `✅ Translation complete!\n\n• ${status.total} rows translated\n•${flaggedNote}\n• Columns: ${targetLangs.map(l => LANG_NAMES[l] || l).join(', ')}\n\nYour file is ready to download.`,
+            content: `✅ Translation complete!\n\n• ${status.total} rows translated\n•${flaggedNote}\n• Columns: ${targetLangs.map(l => langNames[l] || l).join(', ')}\n\nYour file is ready to download. Want me to translate to any other languages too? Just ask.`,
           })
         } else if (status.status === 'failed') {
           clearInterval(pollRef.current)
@@ -113,7 +93,7 @@ export default function App() {
     poll()
     pollRef.current = setInterval(poll, 2000)
     return () => clearInterval(pollRef.current)
-  }, [phase, jobId, targetLangs, addMessage])
+  }, [phase, jobId, targetLangs, langNames, addMessage])
 
   // ── Handlers ─────────────────────────────────────────────────────────────
 
@@ -149,48 +129,55 @@ export default function App() {
     }
   }
 
+  // Every message goes through the chat agent, which decides whether the
+  // user is selecting target language(s) (intent: 'set_languages' — handles
+  // typos, abbreviations, any language) or just chatting/asking a question
+  // (intent: 'chat' — answered directly, no translation job started).
   const handleSend = async () => {
     const text = input.trim()
-    if (!text || isLoading) return
+    if (!text || isLoading || phase === 'translating') return
     setInput('')
     addMessage({ role: 'user', content: text })
+    setIsLoading(true)
 
-    if (phase === 'uploaded') {
-      const langs = parseLanguages(text)
-
-      if (langs.length === 0) {
-        addMessage({
-          role: 'agent',
-          content: "I didn't recognise any languages in that. Try something like \"English and Spanish\" or \"French, Japanese, Korean\".",
-        })
-        return
-      }
-
-      setTargetLangs(langs)
-      const langLabels = langs.map(l => `${LANG_NAMES[l] || l} (${l})`).join(', ')
-      const colList = detectedCols.join(', ')
-
-      addMessage({
-        role: 'agent',
-        content: `Got it — I'll translate **${rowCount} rows** to **${langLabels}**.\nSource columns: ${colList}\n\nStarting translation now...`,
+    try {
+      const result = await chatAgent({
+        sessionId,
+        message: text,
+        phase,
+        targetLanguages: targetLangs,
       })
 
-      setPhase('translating')
-      setIsLoading(true)
+      const canTranslate = !!sessionId && detectedCols.length > 0 && phase !== 'translating'
 
-      try {
-        const { job_id } = await startTranslation({
-          sessionId,
-          targetLanguages: langs,
-          confirmedColumns: detectedCols,
-        })
-        setJobId(job_id)
-      } catch (err) {
-        addMessage({ role: 'agent', content: `❌ Failed to start: ${err.message}` })
-        setPhase('uploaded')
-      } finally {
-        setIsLoading(false)
+      if (result.intent === 'set_languages' && canTranslate) {
+        const langs = result.languages
+        setTargetLangs(langs)
+
+        addMessage({ role: 'agent', content: result.reply })
+
+        setPhase('translating')
+        setJobStatus(null)
+        setJobId(null)
+
+        try {
+          const { job_id } = await startTranslation({
+            sessionId,
+            targetLanguages: langs,
+            confirmedColumns: detectedCols,
+          })
+          setJobId(job_id)
+        } catch (err) {
+          addMessage({ role: 'agent', content: `❌ Failed to start: ${err.message}` })
+          setPhase(detectedCols.length > 0 ? 'uploaded' : 'idle')
+        }
+      } else {
+        addMessage({ role: 'agent', content: result.reply })
       }
+    } catch (err) {
+      addMessage({ role: 'agent', content: `❌ ${err.message}` })
+    } finally {
+      setIsLoading(false)
     }
   }
 
@@ -203,7 +190,9 @@ export default function App() {
 
   // ── Render ────────────────────────────────────────────────────────────────
 
-  const canType = phase === 'uploaded'
+  // Chat is available at any point except mid-translation — users can ask
+  // questions, chat, or (re)select languages whenever it makes sense.
+  const canType = phase !== 'translating'
   const isTranslating = phase === 'translating'
 
   const progressPct = jobStatus?.total
@@ -296,10 +285,10 @@ export default function App() {
               disabled={!canType || isLoading}
               rows={1}
               placeholder={
-                phase === 'idle' ? 'Upload a CSV file above to get started…'
-                : phase === 'uploaded' ? 'e.g. "English and Spanish" or "French, Japanese"'
+                phase === 'idle' ? 'Ask me anything, or upload a CSV above to get started…'
+                : phase === 'uploaded' ? 'e.g. "English and Spanish" — or ask me anything'
                 : phase === 'translating' ? 'Translation in progress…'
-                : phase === 'done' ? 'Download your file above or upload a new one'
+                : phase === 'done' ? 'Ask for more languages, or download your file above'
                 : 'Type a message…'
               }
               className="flex-1 resize-none rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed leading-relaxed"
