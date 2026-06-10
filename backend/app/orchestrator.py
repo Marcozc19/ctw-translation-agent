@@ -108,11 +108,10 @@ async def _process_batch(
         return results
 
     # ── Stage 3: Haiku for escalated rows ─────────────────────────────────
-    esc_batch = [
-        {"id": idx, **{col: next(r["_source"].get(col, "") for r in rows if r["_idx"] == idx)}
-         for col in source_cols}
-        for idx in escalate_ids
-    ]
+    esc_batch = []
+    for idx in escalate_ids:
+        row_data = next(r for r in rows if r["_idx"] == idx)
+        esc_batch.append({"id": idx, **{col: row_data["_source"].get(col, "") for col in source_cols}})
 
     haiku_data = await translate_batch_haiku(esc_batch, source_cols, target_langs, prev_translations)
 
@@ -214,15 +213,16 @@ async def run_translation_job(
         # Write results back into df
         for key in _output_keys(source_columns, target_langs):
             df[key] = ""
-        df["translation_confidence"] = "high"
 
+        # Track flagged rows for /status reporting without adding a
+        # "translation_confidence" column to the downloadable CSV — the
+        # final output should only contain the original Chinese content
+        # plus the translated columns.
         flagged = 0
         for idx, row_result in all_results.items():
             for key, val in row_result["translations"].items():
                 if key in df.columns:
                     df.at[idx, key] = val
-            conf = "review" if row_result["flagged"] else row_result["confidence"]
-            df.at[idx, "translation_confidence"] = conf
             if row_result["flagged"]:
                 flagged += 1
 

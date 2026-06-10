@@ -1,13 +1,21 @@
 import io
 import uuid
 import logging
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load API keys from backend/.env into the process environment before any
+# agent module reads os.getenv(...) for its API clients.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import pandas as pd
 
-from .agents import detect_chinese_columns
+from .agents import detect_chinese_columns, chat_agent, SUPPORTED_LANGUAGES
 from .orchestrator import run_translation_job
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -33,6 +41,35 @@ jobs: dict = {}
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ── Languages ─────────────────────────────────────────────────────────────
+
+@app.get("/languages")
+async def list_languages():
+    return SUPPORTED_LANGUAGES
+
+
+# ── Chat ──────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    session_id: str | None = None
+    message: str
+    phase: str
+    target_languages: list[str] = []
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    session = sessions.get(req.session_id) if req.session_id else None
+    context = {
+        "phase": req.phase,
+        "filename": session["filename"] if session else None,
+        "detected_columns": session["detected_columns"] if session else [],
+        "row_count": len(session["df"]) if session else 0,
+        "current_target_languages": req.target_languages,
+    }
+    return await chat_agent(req.message, context)
 
 
 # ── Upload ────────────────────────────────────────────────────────────────
