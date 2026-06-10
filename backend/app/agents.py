@@ -44,11 +44,8 @@ def _get_claude():
 def _get_gemini():
     global _gemini_model
     if _gemini_model is None:
-        import google.generativeai as genai
-        genai.configure(api_key=os.getenv("GOOGLE_API_KEY", ""))
-        _gemini_model = genai.GenerativeModel(
-            os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-        )
+        from google import genai
+        _gemini_model = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", ""))
     return _gemini_model
 
 
@@ -171,8 +168,12 @@ async def back_translate_gemini(text: str, target_lang: str) -> str | None:
         f"Return ONLY the Chinese translation, nothing else.\n\nText: {text}"
     )
     try:
-        model = await asyncio.to_thread(_get_gemini)
-        response = await asyncio.to_thread(model.generate_content, prompt)
+        client = _get_gemini()
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        response = await client.aio.models.generate_content(
+            model=model_name,
+            contents=prompt,
+        )
         return response.text.strip()
     except Exception as exc:
         logger.warning("Gemini back-translation failed: %s", exc)
