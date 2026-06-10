@@ -139,6 +139,10 @@ async def translate_batch_deepseek(
     )
     user = (
         f"Translate the Chinese fields to {lang_list}.\n"
+        f"Some rows include an optional '_context' field with background notes "
+        f"about the row (e.g. its purpose, audience, or tone). Use it only to "
+        f"inform word choice, tone, and register — do NOT translate it and do "
+        f"NOT include '_context' or '_idx' in your output.\n"
         f"Return a JSON array. Each object must have 'id' (unchanged) plus: {json.dumps(out_keys)}.\n"
         f"Input rows:\n{json.dumps(batch)}"
     )
@@ -246,6 +250,10 @@ async def translate_batch_haiku(
         f"These rows failed quality evaluation. Provide higher-quality translations to {lang_list}.\n"
         f"Output keys per object: 'id' + {json.dumps(out_keys)}.\n"
         f"'_previous_attempt' shows what failed — improve upon it.\n"
+        f"Some rows include an optional '_context' field with background notes "
+        f"about the row (purpose, audience, tone) — use it only to inform word "
+        f"choice and register; do NOT translate it or include '_context' in "
+        f"your output.\n"
         f"Rows:\n{json.dumps(enriched)}"
     )
 

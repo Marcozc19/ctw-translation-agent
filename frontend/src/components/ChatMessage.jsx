@@ -1,3 +1,21 @@
+// Lightweight markdown rendering for chat bubbles — supports **bold** and
+// line breaks, which is all the chat/translation agents currently emit.
+// Avoids pulling in a full markdown dependency for such a small need.
+function renderInline(text, keyPrefix) {
+  return text.split(/(\*\*[^*]+\*\*)/g).map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return <strong key={`${keyPrefix}-${i}`}>{part.slice(2, -2)}</strong>
+    }
+    return <span key={`${keyPrefix}-${i}`}>{part}</span>
+  })
+}
+
+function renderContent(content) {
+  return String(content).split('\n').map((line, i) => (
+    <div key={i}>{line ? renderInline(line, i) : ' '}</div>
+  ))
+}
+
 export default function ChatMessage({ msg }) {
   const isAgent = msg.role === 'agent'
 
@@ -18,7 +36,7 @@ export default function ChatMessage({ msg }) {
           }
         `}
       >
-        {msg.content}
+        {renderContent(msg.content)}
       </div>
 
       {!isAgent && (

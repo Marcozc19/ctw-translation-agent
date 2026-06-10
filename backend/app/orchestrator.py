@@ -31,9 +31,13 @@ async def _process_batch(
     Process one batch through the full pipeline.
     Returns {row_idx: {translations, confidence, flagged}}.
     """
-    # Build API payload (id + one key per source col)
+    # Build API payload (id + one key per source col + optional _context hint)
     batch = [
-        {"id": r["_idx"], **{col: r["_source"].get(col, "") for col in source_cols}}
+        {
+            "id": r["_idx"],
+            **{col: r["_source"].get(col, "") for col in source_cols},
+            **({"_context": r["_context"]} if r.get("_context") else {}),
+        }
         for r in rows
     ]
 
@@ -111,7 +115,11 @@ async def _process_batch(
     esc_batch = []
     for idx in escalate_ids:
         row_data = next(r for r in rows if r["_idx"] == idx)
-        esc_batch.append({"id": idx, **{col: row_data["_source"].get(col, "") for col in source_cols}})
+        esc_batch.append({
+            "id": idx,
+            **{col: row_data["_source"].get(col, "") for col in source_cols},
+            **({"_context": row_data["_context"]} if row_data.get("_context") else {}),
+        })
 
     haiku_data = await translate_batch_haiku(esc_batch, source_cols, target_langs, prev_translations)
 
@@ -165,8 +173,15 @@ async def run_translation_job(
     df: pd.DataFrame,
     source_columns: list[str],
     target_langs: list[str],
+    context_column: str | None = None,
 ) -> None:
-    """Entry point called by FastAPI BackgroundTasks."""
+    """Entry point called by FastAPI BackgroundTasks.
+
+    `context_column`, if provided, names a column (e.g. "description")
+    containing per-row background notes. It's passed to the translation
+    agents as a hint to inform tone/register, but is dropped from the
+    final output CSV — it isn't translated content itself.
+    """
     jobs[job_id]["status"] = "running"
     total = len(df)
 
@@ -179,6 +194,11 @@ async def run_translation_job(
                     col: (str(row[col]) if pd.notna(row[col]) else "")
                     for col in source_columns
                 },
+                "_context": (
+                    str(row[context_column])
+                    if context_column and pd.notna(row.get(context_column, None))
+                    else ""
+                ),
             }
             for idx, row in df.iterrows()
         ]
@@ -214,10 +234,11 @@ async def run_translation_job(
         for key in _output_keys(source_columns, target_langs):
             df[key] = ""
 
-        # Track flagged rows for /status reporting without adding a
-        # "translation_confidence" column to the downloadable CSV — the
-        # final output should only contain the original Chinese content
-        # plus the translated columns.
+        # Write translations back into df. We don't expose the raw
+        # "translation_confidence" levels in the output, but rows that came
+        # back hard-flagged or stayed at "low" confidence even after the
+        # Haiku retry are marked in a trailing "needs_review" column so a
+        # human can quickly find them.
         flagged = 0
         for idx, row_result in all_results.items():
             for key, val in row_result["translations"].items():
@@ -225,6 +246,17 @@ async def run_translation_job(
                     df.at[idx, key] = val
             if row_result["flagged"]:
                 flagged += 1
+
+        # Drop the context/notes column (e.g. "description") from the
+        # output — it was only a hint for the translation agents.
+        if context_column and context_column in df.columns:
+            df = df.drop(columns=[context_column])
+
+        # Add the review flag last so it appears as the rightmost column.
+        df["needs_review"] = ""
+        for idx, row_result in all_results.items():
+            if row_result["flagged"] or row_result["confidence"] == "low":
+                df.at[idx, "needs_review"] = "Yes"
 
         jobs[job_id].update(
             flagged=flagged,
