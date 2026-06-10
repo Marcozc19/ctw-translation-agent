@@ -23,7 +23,7 @@ FastAPI backend
      │
      ├── Agent 2: Low-Cost Translator (DeepSeek V3)
      │       ↓
-     ├── Agent 3: Evaluator (Gemini 2.0 Flash + sentence-transformers)
+     ├── Agent 3: Evaluator (Gemini 2.5 Flash, LLM-as-judge)
      │       ↓ (if score < 0.75)
      └── Agent 4: High-Cost Translator (Claude Haiku 4.5)
                  ↓ (second eval pass)
@@ -40,7 +40,7 @@ Rows are processed in **batches of 10**, up to **5 concurrent batches**. Each ro
 | 0.55–0.74 | `low` — escalated to Haiku |
 | < 0.55 | `review` — hard-flagged, best attempt kept |
 
-Back-translation via **Gemini** + cosine similarity via **paraphrase-multilingual-MiniLM-L12-v2** avoids self-grading bias.
+**Gemini** scores each translation directly against the original Chinese (meaning, completeness, tone/register) — a different model family from the translators, which avoids self-grading bias.
 
 ## Local Development
 
@@ -103,6 +103,6 @@ Vite proxies `/api/*` → `http://localhost:8000` in dev, so no CORS config need
 
 - **DeepSeek V3** for first-pass: best Chinese→X benchmark performance per dollar
 - **Gemini as evaluator**: different model family prevents self-grading bias
-- **Back-translation + cosine similarity**: objective, reproducible quality signal
+- **Direct LLM scoring over back-translation + embeddings**: a single Gemini call judges meaning/completeness/tone directly, which is faster and avoids the heavy `sentence-transformers`/`torch` dependency (~1-2GB) entirely
 - **Hard cap at 2 escalations**: no infinite loops; flagged rows get best attempt
 - **Polling over SSE**: simpler infra, sufficient for <60s jobs

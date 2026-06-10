@@ -3,7 +3,7 @@ Four-agent translation pipeline.
 
 Agent 1: detect_chinese_columns   — Rule-based CJK column identification
 Agent 2: translate_batch_deepseek — Low-cost first-pass (DeepSeek V3)
-Agent 3: evaluate_translation     — Quality eval (Gemini + sentence-transformers)
+Agent 3: evaluate_translation     — Quality eval (Gemini, LLM-as-judge)
 Agent 4: translate_batch_haiku    — High-quality fallback (Claude Haiku 4.5)
 """
 import os
@@ -16,7 +16,6 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # Lazy singletons — loaded on first use to avoid slowing startup
-_embedding_model = None
 _gemini_model = None
 _deepseek_client = None
 _claude_client = None
@@ -47,16 +46,6 @@ def _get_gemini():
         from google import genai
         _gemini_model = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", ""))
     return _gemini_model
-
-
-def _get_embedder():
-    global _embedding_model
-    if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embedding_model = SentenceTransformer(
-            "paraphrase-multilingual-MiniLM-L12-v2"
-        )
-    return _embedding_model
 
 
 # ---------------------------------------------------------------------------
@@ -170,15 +159,34 @@ async def translate_batch_deepseek(
 
 
 # ---------------------------------------------------------------------------
-# Agent 3 — Evaluator (Gemini 2.0 Flash + sentence-transformers)
+# Agent 3 — Evaluator (Gemini 2.5 Flash, LLM-as-judge)
 # ---------------------------------------------------------------------------
 
-async def back_translate_gemini(text: str, target_lang: str) -> str | None:
-    """Translate `text` (in target_lang) back to Simplified Chinese."""
+async def evaluate_translation(original_zh: str, translated: str, target_lang: str) -> tuple[float, bool]:
+    """
+    Ask Gemini to directly judge translation quality (meaning, completeness,
+    tone/register) on a 0.0-1.0 scale, instead of back-translating and
+    comparing embeddings. A different model family than the translators
+    still avoids self-grading bias, without the extra round-trip or the
+    sentence-transformers/torch dependency.
+
+    Returns (score, hard_flagged).
+    score >= 0.75  → high confidence (pass)
+    0.55–0.74      → low confidence (escalate)
+    < 0.55         → hard flag + escalate
+    """
     prompt = (
-        f"Translate the following {_lang_name(target_lang)} text back to Simplified Chinese. "
-        f"Return ONLY the Chinese translation — no pinyin, no alternatives, "
-        f"no explanation, no extra text of any kind.\n\nText: {text}"
+        "You are a translation quality judge. Compare the ORIGINAL Simplified "
+        "Chinese text with its TRANSLATION and score how faithfully the "
+        "translation preserves the original's meaning, completeness, and "
+        "tone/register.\n\n"
+        f"ORIGINAL (Simplified Chinese): {original_zh}\n"
+        f"TRANSLATION ({_lang_name(target_lang)}): {translated}\n\n"
+        "Score from 0.0 (completely wrong or missing) to 1.0 (fully accurate "
+        "and natural). Set \"flagged\" to true only for serious errors: "
+        "mistranslation, missing content, or nonsensical output.\n\n"
+        "Respond with ONLY a JSON object, no markdown, no explanation:\n"
+        '{"score": <number 0.0-1.0>, "flagged": <true|false>}'
     )
     try:
         from google.genai import types
@@ -192,37 +200,17 @@ async def back_translate_gemini(text: str, target_lang: str) -> str | None:
                 thinking_config=types.ThinkingConfig(thinking_budget=0)
             ),
         )
-        return response.text.strip()
+        result = _parse_json(response.text)
+        if result is None:
+            raise ValueError(f"Could not parse evaluator response: {response.text!r}")
+
+        score = float(result.get("score", 0.65))
+        score = max(0.0, min(1.0, score))
+        flagged = bool(result.get("flagged", False)) or score < 0.55
+        return score, flagged
     except Exception as exc:
-        logger.warning("Gemini back-translation failed: %s", exc)
-        return None
-
-
-def compute_similarity(a: str, b: str) -> float:
-    """Cosine similarity between two strings using multilingual embeddings."""
-    try:
-        from sentence_transformers import util
-        model = _get_embedder()
-        embs = model.encode([a, b])
-        return float(util.cos_sim(embs[0], embs[1]))
-    except Exception as exc:
-        logger.warning("Similarity failed: %s", exc)
-        return 0.6  # neutral fallback — won't force escalation
-
-
-async def evaluate_translation(original_zh: str, translated: str, target_lang: str) -> tuple[float, bool]:
-    """
-    Returns (score, hard_flagged).
-    score >= 0.75  → high confidence (pass)
-    0.55–0.74      → low confidence (escalate)
-    < 0.55         → hard flag + escalate
-    """
-    back = await back_translate_gemini(translated, target_lang)
-    if back is None:
+        logger.warning("Gemini evaluation failed: %s", exc)
         return 0.65, False  # can't evaluate; give benefit of the doubt
-
-    score = await asyncio.to_thread(compute_similarity, original_zh, back)
-    return score, score < 0.55
 
 
 # ---------------------------------------------------------------------------
