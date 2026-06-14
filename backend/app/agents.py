@@ -3,7 +3,7 @@ Four-agent translation pipeline.
 
 Agent 1: detect_chinese_columns   — Rule-based CJK column identification
 Agent 2: translate_batch_deepseek — Low-cost first-pass (DeepSeek V3)
-Agent 3: evaluate_translation     — Quality eval (Gemini, LLM-as-judge)
+Agent 3: evaluate_batch_gemini    — Quality eval (Gemini, LLM-as-judge, batched per language)
 Agent 4: translate_batch_haiku    — High-quality fallback (Claude Haiku 4.5)
 """
 import os
@@ -46,6 +46,21 @@ def _get_gemini():
         from google import genai
         _gemini_model = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", ""))
     return _gemini_model
+
+
+async def _retry_with_backoff(fn, attempts=3, base_delay=0.5, max_delay=4.0, label="call"):
+    """Run async `fn()` with exponential backoff, returning the first non-None
+    result or None if every attempt fails / returns None."""
+    for attempt in range(attempts):
+        try:
+            result = await fn()
+            if result is not None:
+                return result
+        except Exception as exc:
+            logger.warning("%s attempt %d failed: %s", label, attempt + 1, exc)
+        if attempt < attempts - 1:
+            await asyncio.sleep(min(base_delay * (2 ** attempt), max_delay))
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -136,59 +151,52 @@ async def translate_batch_deepseek(
         f"Input rows:\n{json.dumps(batch)}"
     )
 
-    for attempt in range(2):
-        try:
-            resp = await _get_deepseek().chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.1,
-                max_tokens=4096,
-            )
-            result = _parse_json(resp.choices[0].message.content)
-            if result:
-                return result
-        except Exception as exc:
-            logger.warning("DeepSeek attempt %d failed: %s", attempt + 1, exc)
-            if attempt == 0:
-                await asyncio.sleep(1)
+    async def _call():
+        resp = await _get_deepseek().chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.1,
+            max_tokens=4096,
+        )
+        return _parse_json(resp.choices[0].message.content)
 
-    return None
+    return await _retry_with_backoff(_call, attempts=3, label="DeepSeek")
 
 
 # ---------------------------------------------------------------------------
-# Agent 3 — Evaluator (Gemini 2.5 Flash, LLM-as-judge)
+# Agent 3 — Evaluator (Gemini 2.5 Flash, LLM-as-judge, batched per language)
 # ---------------------------------------------------------------------------
 
-async def evaluate_translation(original_zh: str, translated: str, target_lang: str) -> tuple[float, bool]:
+async def evaluate_batch_gemini(items: list[dict], target_lang: str) -> list[dict] | None:
     """
     Ask Gemini to directly judge translation quality (meaning, completeness,
-    tone/register) on a 0.0-1.0 scale, instead of back-translating and
-    comparing embeddings. A different model family than the translators
-    still avoids self-grading bias, without the extra round-trip or the
-    sentence-transformers/torch dependency.
+    tone/register) on a 0.0-1.0 scale for a whole batch of rows at once,
+    instead of back-translating and comparing embeddings, and instead of one
+    call per row. A different model family than the translators still avoids
+    self-grading bias, without the extra round-trip or per-row call overhead.
 
-    Returns (score, hard_flagged).
-    score >= 0.75  → high confidence (pass)
-    0.55–0.74      → low confidence (escalate)
-    < 0.55         → hard flag + escalate
+    `items`: [{"id": ..., "original": <Simplified Chinese text>, "translation": <text>}, ...]
+    Returns [{"id": ..., "score": <0.0-1.0>, "flagged": <bool>}, ...] in any
+    order, or None if the call fails after retries.
     """
     prompt = (
-        "You are a translation quality judge. Compare the ORIGINAL Simplified "
-        "Chinese text with its TRANSLATION and score how faithfully the "
-        "translation preserves the original's meaning, completeness, and "
-        "tone/register.\n\n"
-        f"ORIGINAL (Simplified Chinese): {original_zh}\n"
-        f"TRANSLATION ({_lang_name(target_lang)}): {translated}\n\n"
+        "You are a translation quality judge. For each item below, compare the "
+        "ORIGINAL Simplified Chinese text with its TRANSLATION and score how "
+        "faithfully the translation preserves the original's meaning, "
+        f"completeness, and tone/register. Translations are in {_lang_name(target_lang)}.\n\n"
         "Score from 0.0 (completely wrong or missing) to 1.0 (fully accurate "
         "and natural). Set \"flagged\" to true only for serious errors: "
         "mistranslation, missing content, or nonsensical output.\n\n"
-        "Respond with ONLY a JSON object, no markdown, no explanation:\n"
-        '{"score": <number 0.0-1.0>, "flagged": <true|false>}'
+        "Respond with ONLY a JSON array, no markdown, no explanation — one "
+        "object per item, each carrying its original \"id\":\n"
+        '[{"id": <id>, "score": <0.0-1.0>, "flagged": <true|false>}, ...]\n\n'
+        f"Items:\n{json.dumps(items, ensure_ascii=False)}"
     )
-    try:
+
+    async def _call():
         from google.genai import types
 
         client = _get_gemini()
@@ -200,17 +208,9 @@ async def evaluate_translation(original_zh: str, translated: str, target_lang: s
                 thinking_config=types.ThinkingConfig(thinking_budget=0)
             ),
         )
-        result = _parse_json(response.text)
-        if result is None:
-            raise ValueError(f"Could not parse evaluator response: {response.text!r}")
+        return _parse_json(response.text)
 
-        score = float(result.get("score", 0.65))
-        score = max(0.0, min(1.0, score))
-        flagged = bool(result.get("flagged", False)) or score < 0.55
-        return score, flagged
-    except Exception as exc:
-        logger.warning("Gemini evaluation failed: %s", exc)
-        return 0.65, False  # can't evaluate; give benefit of the doubt
+    return await _retry_with_backoff(_call, attempts=3, label="Gemini evaluation")
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +245,7 @@ async def translate_batch_haiku(
         f"Rows:\n{json.dumps(enriched)}"
     )
 
-    try:
+    async def _call():
         resp = await _get_claude().messages.create(
             model=os.getenv("HAIKU_MODEL", "claude-haiku-4-5-20251001"),
             max_tokens=4096,
@@ -253,9 +253,8 @@ async def translate_batch_haiku(
             messages=[{"role": "user", "content": user}],
         )
         return _parse_json(resp.content[0].text)
-    except Exception as exc:
-        logger.error("Haiku translation failed: %s", exc)
-        return None
+
+    return await _retry_with_backoff(_call, attempts=2, label="Haiku")
 
 
 # ---------------------------------------------------------------------------

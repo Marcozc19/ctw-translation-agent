@@ -9,7 +9,7 @@ import pandas as pd
 
 from .agents import (
     translate_batch_deepseek,
-    evaluate_translation,
+    evaluate_batch_gemini,
     translate_batch_haiku,
     _output_keys,
 )
@@ -17,9 +17,69 @@ from .agents import (
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 10
-MAX_CONCURRENT = 5
+MAX_CONCURRENT = 10
 PASS_THRESHOLD = 0.75   # score >= this → high confidence
 ESCALATE_FLOOR = 0.55   # score < this → hard flag regardless of Haiku result
+
+
+async def _evaluate_rows(
+    rows: list[dict],
+    results: dict,
+    eval_col: str,
+    target_langs: list[str],
+) -> dict:
+    """
+    Evaluate translation quality for `rows` using Agent 3 (Gemini), batched
+    per target language — one call covers every row for that language, run
+    concurrently across languages.
+
+    Returns {idx: (worst_score_across_langs, hard_flagged)}.
+    """
+    row_by_idx = {r["_idx"]: r for r in rows}
+    scores = {idx: 1.0 for idx in row_by_idx}
+    hard_flags = {idx: False for idx in row_by_idx}
+    evaluable = []
+
+    for idx, r in row_by_idx.items():
+        original = r["_source"].get(eval_col, "")
+        translations = results[idx]["translations"]
+        if not original or any(
+            not translations.get(f"{eval_col}_{lang}", "") for lang in target_langs
+        ):
+            scores[idx] = 0.0
+            continue
+        evaluable.append(idx)
+
+    async def eval_lang(lang: str):
+        items = [
+            {
+                "id": idx,
+                "original": row_by_idx[idx]["_source"][eval_col],
+                "translation": results[idx]["translations"][f"{eval_col}_{lang}"],
+            }
+            for idx in evaluable
+        ]
+        if not items:
+            return []
+        return await evaluate_batch_gemini(items, lang)
+
+    for lang_result in await asyncio.gather(*[eval_lang(lang) for lang in target_langs]):
+        if lang_result is None:
+            # Whole-language eval failed after retries — give the benefit of
+            # the doubt but still escalate (matches the prior single-row fallback).
+            for idx in evaluable:
+                scores[idx] = min(scores[idx], 0.65)
+            continue
+        for item in lang_result:
+            idx = item.get("id")
+            if idx not in scores:
+                continue
+            score = max(0.0, min(1.0, float(item.get("score", 0.65))))
+            if item.get("flagged") or score < ESCALATE_FLOOR:
+                hard_flags[idx] = True
+            scores[idx] = min(scores[idx], score)
+
+    return {idx: (scores[idx], hard_flags[idx]) for idx in row_by_idx}
 
 
 async def _process_batch(
@@ -70,37 +130,12 @@ async def _process_batch(
     # ── Stage 2: Evaluate (first col × all langs as signal) ────────────────
     eval_col = source_cols[0]
 
-    async def eval_row(r: dict):
-        idx = r["_idx"]
-        original = r["_source"].get(eval_col, "")
-        if not original:
-            return idx, None
-
-        worst_score = 1.0
-        hard_flag = False
-
-        for lang in target_langs:
-            trans = results[idx]["translations"].get(f"{eval_col}_{lang}", "")
-            if not trans:
-                worst_score = 0.0
-                break
-            score, flagged = await evaluate_translation(original, trans, lang)
-            if flagged:
-                hard_flag = True
-            if score < worst_score:
-                worst_score = score
-
-        return idx, (worst_score, hard_flag)
-
-    eval_results = await asyncio.gather(*[eval_row(r) for r in rows], return_exceptions=True)
+    eval_results = await _evaluate_rows(rows, results, eval_col, target_langs)
 
     escalate_ids = []
     prev_translations = {}
 
-    for res in eval_results:
-        if isinstance(res, Exception) or res[1] is None:
-            continue
-        idx, (score, hard_flag) = res
+    for idx, (score, hard_flag) in eval_results.items():
         if score < PASS_THRESHOLD:
             escalate_ids.append(idx)
             prev_translations[idx] = results[idx]["translations"].copy()
@@ -134,34 +169,16 @@ async def _process_batch(
                     results[idx]["translations"][key] = val
 
         # ── Stage 4: Re-evaluate Haiku output ─────────────────────────────
-        async def re_eval_row(idx):
-            r_data = next((r for r in rows if r["_idx"] == idx), None)
-            if r_data is None:
-                return idx, None
-            original = r_data["_source"].get(eval_col, "")
-            if not original:
-                return idx, None
+        # Hard-flagged rows are already destined for "review" regardless of
+        # the re-eval outcome, so skip them entirely and save the call.
+        re_eval_ids = [idx for idx in escalate_ids if not results[idx]["flagged"]]
 
-            worst_score = 1.0
-            for lang in target_langs:
-                trans = results[idx]["translations"].get(f"{eval_col}_{lang}", "")
-                if not trans:
-                    worst_score = 0.0
-                    break
-                score, _ = await evaluate_translation(original, trans, lang)
-                if score < worst_score:
-                    worst_score = score
-            return idx, worst_score
+        if re_eval_ids:
+            re_eval_rows = [r for r in rows if r["_idx"] in re_eval_ids]
+            re_evals = await _evaluate_rows(re_eval_rows, results, eval_col, target_langs)
 
-        re_evals = await asyncio.gather(*[re_eval_row(idx) for idx in escalate_ids], return_exceptions=True)
-
-        for res in re_evals:
-            if isinstance(res, Exception) or res[1] is None:
-                continue
-            idx, score = res
-            if score >= PASS_THRESHOLD:
-                # Haiku passed — clear low-confidence flag if not hard-flagged
-                if not results[idx]["flagged"]:
+            for idx, (score, _) in re_evals.items():
+                if score >= PASS_THRESHOLD:
                     results[idx]["confidence"] = "high"
 
     return results

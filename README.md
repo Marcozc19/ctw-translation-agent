@@ -40,7 +40,7 @@ Rows are processed in **batches of 10**, up to **5 concurrent batches**. Each ro
 | 0.55–0.74 | `low` — escalated to Haiku |
 | < 0.55 | `review` — hard-flagged, best attempt kept |
 
-**Gemini** scores each translation directly against the original Chinese (meaning, completeness, tone/register) — a different model family from the translators, which avoids self-grading bias.
+**Gemini** scores each translation directly against the original Chinese (meaning, completeness, tone/register) — a different model family from the translators, which avoids self-grading bias. Evaluation is batched per target language (one call covers every row in a batch, run concurrently across languages) rather than one call per row.
 
 ## Local Development
 
