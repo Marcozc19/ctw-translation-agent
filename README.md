@@ -9,7 +9,7 @@ A chat-based translation agent that accepts a CSV of Chinese content and returns
 | Layer | Service |
 |-------|---------|
 | Frontend | Vercel |
-| Backend | Railway |
+| Backend | Render |
 
 ## Architecture
 
@@ -71,16 +71,16 @@ Vite proxies `/api/*` → `http://localhost:8000` in dev, so no CORS config need
 
 ## Deployment
 
-### Backend → Railway
+### Backend → Render
 
-1. Connect this repo in Railway, set root to `/backend`
-2. Add env vars: `DEEPSEEK_API_KEY`, `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`
-3. Railway auto-detects `railway.toml` and runs uvicorn
+1. Connect this repo in Render — it picks up the root-level `render.yaml` (Blueprint) automatically, including the free plan, build/start commands, and health check
+2. Add the secret env vars when prompted: `DEEPSEEK_API_KEY`, `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`
+3. Deploy — note the free tier spins down after 15 minutes of inactivity, so the first request after idle takes ~30-50s to wake up
 
 ### Frontend → Vercel
 
 1. Connect this repo in Vercel (root-level `vercel.json` already configured)
-2. Add env var: `VITE_API_URL=https://your-railway-app.railway.app`
+2. Add env var: `VITE_API_URL=https://your-render-app.onrender.com`
 3. Deploy
 
 ## API Keys Required
